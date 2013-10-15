@@ -21,7 +21,7 @@ This module is specifically meant to be used for the cosmo celery tasks
 which import the `set_up_chef_client` decorator and the `run_chef` function.
 """
 
-from cosmo.celery import celery
+from celery.utils.log import get_task_logger
 from functools import wraps
 import re
 import os
@@ -32,7 +32,7 @@ import subprocess
 import json
 
 CHEF_INSTALLER_URL = "https://www.opscode.com/chef/install.sh"
-logger = celery.utils.log.get_task_logger(__name__)
+logger = get_task_logger(__name__)
 
 
 class SudoError(Exception):
