@@ -1,0 +1,22 @@
+__author__ = 'elip'
+
+import setuptools
+
+COSMO_CELERY_VERSION = "0.1.1"
+COSMO_CELERY = "https://github.com/CloudifySource/cosmo-celery-common/tarball/{0}".format(COSMO_CELERY_VERSION)
+
+setuptools.setup(
+    zip_safe=False,
+    name='cosmo-plugin-chef-client-common',
+    version='0.1.0',
+    author='yoni',
+    author_email='yoni@fewbytes.com',
+    packages=['chef_client_common'],
+    license='LICENSE',
+    description='Common code for chef related cosmo plugins',
+    install_requires=[
+        "celery",
+        "cosmo-celery-common"
+    ],
+    dependency_links=["{0}#egg=cosmo-celery-common-{1}".format(COSMO_CELERY, COSMO_CELERY_VERSION)]
+)
