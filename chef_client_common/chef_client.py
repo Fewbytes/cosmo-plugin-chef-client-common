@@ -22,7 +22,6 @@ which import the `set_up_chef_client` decorator and the `run_chef` function.
 """
 
 from cosmo.celery import celery
-import celery.utils.log
 from functools import wraps
 import re
 import os
@@ -34,6 +33,7 @@ import json
 
 CHEF_INSTALLER_URL = "https://www.opscode.com/chef/install.sh"
 logger = celery.utils.log.get_task_logger(__name__)
+
 
 class SudoError(Exception):
     """An internal exception for failures when running an os command with sudo"""

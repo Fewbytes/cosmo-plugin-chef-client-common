@@ -1,4 +1,4 @@
-__author__ = 'elip'
+__author__ = 'dank'
 
 import setuptools
 
