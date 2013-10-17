@@ -204,6 +204,10 @@ def set_up_chef_client(func):
         required_fields = {'chef_version', 'chef_server_url', 'chef_environment',
                            'chef_validator_name', 'chef_validation'}
 
+        # relationship based task
+        if '__source_properties' in kwargs:
+            kwargs = kwargs['__source_properties']
+
         missing_fields = required_fields.difference(kwargs.keys())
         if missing_fields:
             raise ChefError("The following required field(s) are missing: %s"
