@@ -174,6 +174,13 @@ def run_chef(runlist, attributes=None):
     """Run runlist with chef-client using these attributes(json or dict)"""
     # I considered moving the attribute handling to the set-up phase but
     # eventually left it here, to allow specific tasks to easily override them.
+
+    if runlist is None:
+        return
+
+    if attributes is None:
+        attributes = {}
+
     if isinstance(attributes, str):  # assume we received json
         try:
             attributes = json.loads(attributes or "{}")
