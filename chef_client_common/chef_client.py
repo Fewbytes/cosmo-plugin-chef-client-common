@@ -150,7 +150,7 @@ def install_chef(chef_version, chef_server_url, chef_environment,
 
     logger.info('Setting up chef-client [chef_server=\n%s]', chef_server_url)
     for directory in '/etc/chef', '/var/chef', '/var/log/chef':
-        sudo("mkdir", directory)
+        sudo("mkdir -p", directory)
 
     if chef_validation:
         sudo_write_file(VALIDATION_FILE, chef_validation)
