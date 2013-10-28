@@ -125,8 +125,10 @@ def current_chef_version():
 
 
 def install_chef(chef_version, chef_server_url, chef_environment,
-                 chef_validator_name, chef_validation):
+                 chef_validator_name, chef_validation=None):
     """If needed, install chef-client and point it to the server"""
+
+    VALIDATION_FILE = '/etc/chef/validation.pem'
     current_version = current_chef_version()
     if current_version:  # we found an existing chef version
         if equal_versions(current_version, chef_version):
@@ -150,13 +152,18 @@ def install_chef(chef_version, chef_server_url, chef_environment,
     for directory in '/etc/chef', '/var/chef', '/var/log/chef':
         sudo("mkdir", directory)
 
-    sudo_write_file('/etc/chef/validation.pem', chef_validation)
+    if chef_validation:
+        sudo_write_file(VALIDATION_FILE, chef_validation)
+    else:
+        if not os.path.isfile(VALIDATION_FILE):
+            raise ChefError("Validation key was not specified and the file {0} does not exist".format(VALIDATION_FILE))
+
     sudo_write_file('/etc/chef/client.rb', """
 log_level          :info
 log_location       "/var/log/chef/client.log"
 ssl_verify_mode    :verify_none
 validation_client_name "{chef_validator_name}"
-validation_key         "/etc/chef/validation.pem"
+validation_key         "{chef_validator_file}"
 client_key             "/etc/chef/client.pem"
 chef_server_url    "{server_url}"
 environment    "{server_environment}"
@@ -166,7 +173,8 @@ pid_file           "/var/run/chef/client.pid"
 Chef::Log::Formatter.show_time = true
         """.format(server_url=chef_server_url,
                    server_environment=chef_environment,
-                   chef_validator_name=chef_validator_name)
+                   chef_validator_name=chef_validator_name,
+                   chef_validator_file=VALIDATION_FILE)
     )
 
 
