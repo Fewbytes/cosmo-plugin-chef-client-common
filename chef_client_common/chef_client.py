@@ -24,6 +24,7 @@ which import the `set_up_chef_client` decorator and the `run_chef` function.
 from celery.utils.log import get_task_logger
 from functools import wraps
 import re
+import requests
 import os
 import stat
 import urllib
@@ -33,6 +34,8 @@ import json
 
 CHEF_INSTALLER_URL = "https://www.opscode.com/chef/install.sh"
 logger = get_task_logger(__name__)
+
+ROLES_DIR = "/var/chef/roles"
 
 
 class SudoError(Exception):
@@ -124,8 +127,8 @@ def current_chef_version():
     return subprocess.check_output(["/usr/bin/sudo", "chef-client", "--version"])
 
 
-def install_chef(chef_version, chef_server_url, chef_environment,
-                 chef_validator_name, chef_validation):
+def install_chef(chef_version, chef_server_url=None, chef_environment=None,
+                 chef_validator_name=None, chef_validation=None, solo=False):
     """If needed, install chef-client and point it to the server"""
     current_version = current_chef_version()
     if current_version:  # we found an existing chef version
@@ -147,11 +150,16 @@ def install_chef(chef_version, chef_server_url, chef_environment,
 
 
     logger.info('Setting up chef-client [chef_server=\n%s]', chef_server_url)
-    for directory in '/etc/chef', '/var/chef', '/var/log/chef':
-        sudo("mkdir", directory)
 
-    sudo_write_file('/etc/chef/validation.pem', chef_validation)
-    sudo_write_file('/etc/chef/client.rb', """
+    for directory in '/etc/chef', '/var/chef', '/var/log/chef', ROLES_DIR:
+        sudo("mkdir", "-p", directory)
+
+    if solo:
+        pass
+    else:
+        if chef_validation:
+            sudo_write_file('/etc/chef/validation.pem', chef_validation)
+        sudo_write_file('/etc/chef/client.rb', """
 log_level          :info
 log_location       "/var/log/chef/client.log"
 ssl_verify_mode    :verify_none
@@ -164,13 +172,13 @@ file_cache_path    "/var/chef/cache"
 file_backup_path   "/var/chef/backup"
 pid_file           "/var/run/chef/client.pid"
 Chef::Log::Formatter.show_time = true
-        """.format(server_url=chef_server_url,
-                   server_environment=chef_environment,
-                   chef_validator_name=chef_validator_name)
-    )
+            """.format(server_url=chef_server_url,
+                       server_environment=chef_environment,
+                       chef_validator_name=chef_validator_name)
+        )
 
 
-def run_chef(runlist, attributes=None):
+def run_chef(runlist, attributes={}, chef_cookbooks=None, chef_roles=None):
     """Run runlist with chef-client using these attributes(json or dict)"""
     # I considered moving the attribute handling to the set-up phase but
     # eventually left it here, to allow specific tasks to easily override them.
@@ -178,8 +186,7 @@ def run_chef(runlist, attributes=None):
     if runlist is None:
         return
 
-    if attributes is None:
-        attributes = {}
+    solo = bool(chef_cookbooks)
 
     if isinstance(attributes, str):  # assume we received json
         try:
@@ -192,11 +199,28 @@ def run_chef(runlist, attributes=None):
     json.dump(attributes, attribute_file)
     attribute_file.close()
 
+    if solo:
+        # Chef solo mode
+        if chef_roles:
+            import tarfile
+            import StringIO
+            with tarfile.open(fileobj=StringIO.StringIO(requests.get(chef_roles).content), mode="r:gz") as tar:
+                for tarinfo in tar:
+                    if tarinfo.isreg():
+                        e = tar.extractfile(tarinfo)
+                        with open(os.path.join(ROLES_DIR,os.path.basename(tarinfo.name)), 'w') as dst:
+                            dst.write(e.read())
+
+
+        cmd = ["chef-solo", "-o", runlist, "-j", attribute_file.name, "--force-formatter", "-r", chef_cookbooks]
+    else:
+        # Chef client mode
+        cmd = ["chef-client", "-o", runlist, "-j", attribute_file.name, "--force-formatter"]
     try:
         #TODO: I chose to use --force-formatter here to push output through stdout to be caught inside sudo()
         #      so that it can be included in exceptions, but with current implementation of sudo(),
         #      I'm completely losing output of successful runs. If needed, we can perhaps put it back in /var/log/chef/
-        sudo("chef-client", "-o", runlist, "-j", attribute_file.name, "--force-formatter")
+        sudo(*cmd)
         os.remove(attribute_file.name)  # on failure, leave for debugging
     except SudoError as exc:
         raise ChefError("The chef run failed\n"
@@ -208,8 +232,10 @@ def set_up_chef_client(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         """Pass to install_chef the fields it needs"""
-        required_fields = {'chef_version', 'chef_server_url', 'chef_environment',
-                           'chef_validator_name', 'chef_validation'}
+        required_fields = {'chef_version', 'chef_environment'}
+        chef_client_fields = {'chef_server_url', 'chef_validator_name', 'chef_validation'}
+        chef_solo_fieds = {'chef_cookbooks'}
+        installer_fields = required_fields.union(chef_client_fields).union(chef_solo_fieds)
 
         # relationship based task
         if '__source_properties' in kwargs:
@@ -220,9 +246,38 @@ def set_up_chef_client(func):
             raise ChefError("The following required field(s) are missing: %s"
                                % ", ".join(missing_fields))
 
-        install_args = {k: v for k, v in kwargs.items() if k in required_fields}
+        install_args = {k: v for k, v in kwargs.items() if k in installer_fields}
+        if 'chef_cookbooks' in install_args:
+            install_args['solo'] = True
+            del install_args['chef_cookbooks']
         install_chef(**install_args)
 
         return func(*args, **kwargs)
 
     return wrapper
+
+if __name__ == '__main__':
+    import argparse
+    import logging as l
+    parser = argparse.ArgumentParser(
+        description="Installs and runs Chef (client or solo)"
+    )
+    parser.add_argument(
+        '--cookbooks',
+        type=str
+    )
+    parser.add_argument(
+        '-r', '--run-list',
+        type=str
+    )
+    parser.add_argument(
+        '--roles',
+        type=str
+    )
+    args = parser.parse_args()
+    # print(args)
+    @set_up_chef_client
+    def task(**kwargs):
+        run_chef(args.run_list, {}, chef_cookbooks=args.cookbooks, chef_roles=args.roles)
+    logger = l.getLogger(__name__)
+    task(chef_environment='_default', chef_version='11.4.4-2')

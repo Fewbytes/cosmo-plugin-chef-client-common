@@ -17,7 +17,8 @@ setuptools.setup(
     description='Common code for chef related cosmo plugins',
     install_requires=[
         "celery",
-        "cosmo-celery-common"
+        "cosmo-celery-common",
+        "requests",
     ],
     dependency_links=["{0}#egg=cosmo-celery-common-{1}".format(COSMO_CELERY, COSMO_CELERY_VERSION)]
 )
