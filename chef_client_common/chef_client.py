@@ -257,8 +257,7 @@ def get_manager(*args, **kwargs):
         if cls.can_handle(*args, **kwargs):
             logger.info("Chef manager class: %s".format(cls))
             cls.assert_args(*args, **kwargs)
-            manager = cls()
-            return manager
+            return cls()
     arguments_sets = '; '.join(['(for ' + m.NAME + '): ' + ', '.join(list(m.REQUIRED_ARGS)) for m in managers])
     raise ChefError("Failed to find appropriate Chef manager for the specified arguments ({0}, {1}). Possible arguments sets are: {2}".format(args, kwargs, arguments_sets))
 
