@@ -15,10 +15,10 @@
 # *******************************************************************************/
 
 """
-This module provides functions for installing, configuring and running chef-client against an existing chef-server.
+This module provides functions for installing, configuring and running chef-client against an existing chef-server or chef-solo.
 
 This module is specifically meant to be used for the cosmo celery tasks
-which import the `set_up_chef_client` decorator and the `run_chef` function.
+which import the `run_chef` function.
 """
 
 from celery.utils.log import get_task_logger
@@ -33,9 +33,9 @@ import subprocess
 import json
 
 CHEF_INSTALLER_URL = "https://www.opscode.com/chef/install.sh"
-logger = get_task_logger(__name__)
-
 ROLES_DIR = "/var/chef/roles"
+
+logger = get_task_logger(__name__)
 
 
 class SudoError(Exception):
@@ -48,213 +48,245 @@ class ChefError(Exception):
     pass
 
 
-def sudo(*args):
-    """a helper to run a subprocess with sudo, raises SudoError"""
+class ChefManager(object):
 
-    def get_file_contents(file_obj):
-        file_obj.flush()
-        file_obj.seek(0)
-        return  ''.join(file_obj.readlines())
+    @classmethod
+    def can_handle(cls, *args, **kwargs):
+        # Can handle if all required arguments present
+        if cls.REQUIRED_ARGS.difference(kwargs.keys()):
+            return False
+        for arg in cls.REQUIRED_ARGS:
+            if not kwargs[arg]:
+                return False
+        return True
 
-    command_list = ["/usr/bin/sudo"] + list(args)
-    logger.info("Running: '%s'", ' '.join(command_list))
+    @classmethod
+    def assert_args(cls, *args, **kwargs):
+        # print cls.REQUIRED_ARGS
+        missing_fields = (cls.REQUIRED_ARGS).union({'chef_version'}).difference(kwargs.keys())
+        if missing_fields:
+            raise ChefError("The following required field(s) are missing: {0}".format(", ".join(missing_fields)))
 
-    #TODO: Should we put the stdout/stderr in the celery logger? should we also keep output of successful runs?
-    #      per log level? Also see comment under run_chef()
-    stdout = tempfile.TemporaryFile('rw+b')
-    stderr = tempfile.TemporaryFile('rw+b')
-    try:
-        subprocess.check_call(command_list, stdout=stdout, stderr=stderr)
-    except subprocess.CalledProcessError as exc:
-        raise SudoError("{exc}\nSTDOUT:\n{stdout}\nSTDERR:{stderr}".format(
-            exc=exc, stdout=get_file_contents(stdout), stderr=get_file_contents(stderr))
-        )
-    finally:
-        stdout.close()
-        stderr.close()
+    def get_version(self):
+        """Check if chef-client is available and is of the right version"""
+        binary = self._get_binary()
+        if not self._prog_available_for_root(binary):
+            return None
+
+        return self._extract_chef_version(subprocess.check_output(["/usr/bin/sudo", binary, "--version"]))
+
+    def install(self, *args, **kwargs):
+        # print("install() 1")
+        """If needed, install chef-client and point it to the server"""
+        chef_version = kwargs['chef_version']
+        current_version = self.get_version()
+        # print current_version, self._extract_chef_version(chef_version), current_version == self._extract_chef_version(chef_version)
+        if current_version:
+            if current_version == self._extract_chef_version(chef_version):
+                return
+            else:
+                self.uninstall()
+
+        # print("install() 2")
+        logger.info('Installing Chef [chef_version=%s]', chef_version)
+        chef_install_script = tempfile.NamedTemporaryFile(suffix="install.sh", delete=False)
+        chef_install_script.close()
+        try:
+            urllib.urlretrieve(CHEF_INSTALLER_URL, chef_install_script.name)
+            os.chmod(chef_install_script.name, stat.S_IRWXU)
+            self._sudo(chef_install_script.name, "-v", chef_version)
+            os.remove(chef_install_script.name)  # on failure, leave for debugging
+        except Exception as exc:
+            raise ChefError("Chef install failed on:\n%s" % exc)
+
+        # print("install() 3")
+        logger.info('Setting up Chef [chef_server=\n%s]', kwargs.get('chef_server_url'))
+
+        for directory in '/etc/chef', '/var/chef', '/var/log/chef', ROLES_DIR:
+            self._sudo("mkdir", "-p", directory)
+
+        # print("install() 4")
+        # print "P1", args, kwargs
+        self._install_files(*args, **kwargs)
+
+    def uninstall(self):
+        """Uninstall chef-client - currently only supporting apt-get"""
+        #TODO: I didn't find a single method encouraged by opscode,
+        #      so we need to add manually for any supported platform
+        def apt_platform():  # assuming that if apt-get exists, it's how chef was installed
+            return self._prog_available_for_root('apt-get')
+
+        if apt_platform():
+            logger.info("Uninstalling old Chef via apt-get")
+            try:
+                self._sudo("apt-get", "remove", "chef", "-y")
+            except SudoError as exc:
+                raise ChefError("chef-client uninstall failed on:\n%s" % exc)
+        else:
+            logger.info("Chef uninstall is unimplemented for this platform, proceeding anyway")
+
+    def run(self, runlist, chef_attributes={}, *args, **kwargs):
+        self._prepare_for_run(runlist, *args, **kwargs)
+        self.attribute_file = tempfile.NamedTemporaryFile(suffix="chef_attributes.json",
+                                                     delete=False)
+        json.dump(chef_attributes, self.attribute_file)
+        self.attribute_file.close()
+
+        cmd = self._get_cmd(runlist, *args, **kwargs)
+
+        try:
+            self._sudo(*cmd)
+            os.remove(self.attribute_file.name) # on failure, leave for debugging
+        except SudoError as exc:
+            raise ChefError("The chef run failed\n"
+                            "runlist: {0}\nattributes: {1}\nexception: \n{2}".format(runlist, kwargs.get('chef_attributes'), exc))
 
 
-def sudo_write_file(filename, contents):
-    """a helper to create a file with sudo"""
-    with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        temp_file.write(contents)
+    def _prepare_for_run(self, *args, **kwargs):
+        pass
 
-    sudo("mv", temp_file.name, filename)
+    # Utilities from here to end of the class
 
-
-def equal_versions(version1, version2):
-    """Are these two chef versions the same?"""
-    def extract_numeric_version(version_string):
-        """Extract the x.y.z part of the version"""
+    def _extract_chef_version(self, version_string):
         match = re.search(r'(\d+\.\d+\.\d+)', version_string)
         if match:
             return match.groups()[0]
         else:
             raise ChefError("Failed to read chef version - '%s'" % version_string)
 
-    return extract_numeric_version(version1) == extract_numeric_version(version2)
-
-
-def uninstall_chef():
-    """Uninstall chef-client - currently only supporting apt-get"""
-    #TODO: I didn't find a single method encouraged by opscode,
-    #      so we need to add manually for any supported platform
-    def apt_platform():  # assuming that if apt-get exists, it's how chef was installed
+    def _prog_available_for_root(self, prog):
         with open(os.devnull, "w") as fnull:
-            which_exitcode = subprocess.call(["/usr/bin/sudo", "which", "apt-get"],
-                                             stdout = fnull, stderr = fnull)
-        return which_exitcode != 0
+            which_exitcode = subprocess.call(["/usr/bin/sudo", "which", prog], stdout=fnull, stderr=fnull)
+        return which_exitcode == 0
 
-    if apt_platform():
-        logger.info("Uninstalling old chef-client via apt-get")
+    def _sudo(self, *args):
+        """a helper to run a subprocess with sudo, raises SudoError"""
+
+        def get_file_contents(file_obj):
+            file_obj.flush()
+            file_obj.seek(0)
+            return  ''.join(file_obj.readlines())
+
+        command_list = ["/usr/bin/sudo"] + list(args)
+        logger.info("Running: '%s'", ' '.join(command_list))
+
+        #TODO: Should we put the stdout/stderr in the celery logger? should we also keep output of successful runs?
+        #      per log level? Also see comment under run_chef()
+        stdout = tempfile.TemporaryFile('rw+b')
+        stderr = tempfile.TemporaryFile('rw+b')
         try:
-            sudo("apt-get", "remove", "chef", "-y")
-        except SudoError as exc:
-            raise ChefError("chef-client uninstall failed on:\n%s" % exc)
-    else:
-        logger.info("Chef uninstall is unimplemented for this platform, proceeding anyway")
+            subprocess.check_call(command_list, stdout=stdout, stderr=stderr)
+        except subprocess.CalledProcessError as exc:
+            raise SudoError("{exc}\nSTDOUT:\n{stdout}\nSTDERR:{stderr}".format(
+                exc=exc, stdout=get_file_contents(stdout), stderr=get_file_contents(stderr))
+            )
+        finally:
+            stdout.close()
+            stderr.close()
 
 
-def current_chef_version():
-    """Check if chef-client is available and is of the right version"""
-    with open(os.devnull, "w") as fnull:
-        which_exitcode = subprocess.call(["/usr/bin/sudo", "which", "chef-client"],
-                                         stdout = fnull, stderr = fnull)
+    def _sudo_write_file(self, filename, contents):
+        """a helper to create a file with sudo"""
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            temp_file.write(contents)
 
-    if which_exitcode != 0:
-        return None
-
-    return subprocess.check_output(["/usr/bin/sudo", "chef-client", "--version"])
+        # print temp_file.name, filename
+        self._sudo("mv", temp_file.name, filename)
 
 
-def install_chef(chef_version, chef_server_url=None, chef_environment=None,
-                 chef_validator_name=None, chef_validation=None, solo=False):
-    """If needed, install chef-client and point it to the server"""
-    current_version = current_chef_version()
-    if current_version:  # we found an existing chef version
-        if equal_versions(current_version, chef_version):
-            return  # no need to do anything
-        else:
-            uninstall_chef()
+class ChefClientManager(ChefManager):
 
-    logger.info('Installing chef-client [chef_version=%s]', chef_version)
-    chef_install_script = tempfile.NamedTemporaryFile(suffix="install.sh", delete=False)
-    chef_install_script.close()
-    try:
-        urllib.urlretrieve(CHEF_INSTALLER_URL, chef_install_script.name)
-        os.chmod(chef_install_script.name, stat.S_IRWXU)
-        sudo(chef_install_script.name, "-v", chef_version)
-        os.remove(chef_install_script.name)  # on failure, leave for debugging
-    except Exception as exc:
-        raise ChefError("chef-client install failed on:\n%s" % exc)
+    NAME = 'client'
+    REQUIRED_ARGS = {'chef_server_url', 'chef_validator_name', 'chef_validation', 'chef_environment'}
 
+    def _get_cmd(self, runlist, *args, **kwargs):
+        return ["chef-client", "-o", runlist, "-j", self.attribute_file.name, "--force-formatter"]
+    def _get_binary(self):
+        return 'chef-client'
 
-    logger.info('Setting up chef-client [chef_server=\n%s]', chef_server_url)
-
-    for directory in '/etc/chef', '/var/chef', '/var/log/chef', ROLES_DIR:
-        sudo("mkdir", "-p", directory)
-
-    if solo:
-        pass
-    else:
-        if chef_validation:
-            sudo_write_file('/etc/chef/validation.pem', chef_validation)
-        sudo_write_file('/etc/chef/client.rb', """
+    def _install_files(self, *args, **kwargs):
+        # print "P2", args, kwargs
+        if kwargs.get('chef_validation'):
+            self._sudo_write_file('/etc/chef/validation.pem', kwargs['chef_validation'])
+        self._sudo_write_file('/etc/chef/client.rb', """
 log_level          :info
 log_location       "/var/log/chef/client.log"
 ssl_verify_mode    :verify_none
 validation_client_name "{chef_validator_name}"
 validation_key         "/etc/chef/validation.pem"
 client_key             "/etc/chef/client.pem"
-chef_server_url    "{server_url}"
-environment    "{server_environment}"
+chef_server_url    "{chef_server_url}"
+environment    "{chef_environment}"
 file_cache_path    "/var/chef/cache"
 file_backup_path   "/var/chef/backup"
 pid_file           "/var/run/chef/client.pid"
 Chef::Log::Formatter.show_time = true
-            """.format(server_url=chef_server_url,
-                       server_environment=chef_environment,
-                       chef_validator_name=chef_validator_name)
+            """.format(**kwargs)
         )
 
 
-def run_chef(runlist, attributes={}, chef_cookbooks=None, chef_roles=None):
-    """Run runlist with chef-client using these attributes(json or dict)"""
+class ChefSoloManager(ChefManager):
+
+    NAME = 'solo'
+    REQUIRED_ARGS = {'chef_cookbooks'}
+
+    def _prepare_for_run(self, *args, **kwargs):
+        if kwargs.get('chef_roles'):
+            import tarfile
+            import StringIO
+            with tarfile.open(fileobj=StringIO.StringIO(requests.get(kwargs['chef_roles']).content), mode="r:gz") as tar:
+                for tarinfo in tar:
+                    if tarinfo.isreg():
+                        e = tar.extractfile(tarinfo)
+                        with open(os.path.join(ROLES_DIR, os.path.basename(tarinfo.name)), 'w') as dst:
+                            dst.write(e.read())
+
+    def _get_cmd(self, runlist, *args, **kwargs):
+        return ["chef-solo", "-o", runlist, "-j", self.attribute_file.name, "--force-formatter", "-r", kwargs['chef_cookbooks']]
+
+    def _get_binary(self):
+        return 'chef-solo'
+
+    def _install_files(self, *args, **kwargs):
+        self._sudo_write_file('/etc/chef/solo.rb', '')
+
+
+def get_manager(*args, **kwargs):
+    managers = ChefClientManager, ChefSoloManager
+    for cls in managers:
+        if cls.can_handle(*args, **kwargs):
+            logger.info("Chef manager class: %s".format(cls))
+            cls.assert_args(*args, **kwargs)
+            manager = cls()
+            return manager
+    arguments_sets = '; '.join(['(for ' + m.NAME + '): ' + ', '.join(list(m.REQUIRED_ARGS)) for m in managers])
+    raise ChefError("Failed to find appropriate Chef manager for the specified arguments ({0}, {1}). Possible arguments sets are: {2}".format(args, kwargs, arguments_sets))
+
+
+def run_chef(runlist, chef_attributes={}, **kwargs):
+    """Run runlist with chef-client using these chef_attributes(json or dict)"""
     # I considered moving the attribute handling to the set-up phase but
     # eventually left it here, to allow specific tasks to easily override them.
 
     if runlist is None:
         return
 
-    solo = bool(chef_cookbooks)
+    # relationship based task
+    if '__source_properties' in kwargs:
+        kwargs = kwargs['__source_properties']
 
-    if isinstance(attributes, str):  # assume we received json
+    if isinstance(chef_attributes, str):  # assume we received json
         try:
-            attributes = json.loads(attributes or "{}")
+            chef_attributes = json.loads(chef_attributes or "{}")
         except ValueError:
-            raise ChefError("Failed json validation of chef attributes:\n%s" % attributes)
+            raise ChefError("Failed json validation of chef chef_attributes:\n%s" % chef_attributes)
 
-    attribute_file = tempfile.NamedTemporaryFile(suffix="chef_attributes.json",
-                                                 delete=False)
-    json.dump(attributes, attribute_file)
-    attribute_file.close()
-
-    if solo:
-        # Chef solo mode
-        if chef_roles:
-            import tarfile
-            import StringIO
-            with tarfile.open(fileobj=StringIO.StringIO(requests.get(chef_roles).content), mode="r:gz") as tar:
-                for tarinfo in tar:
-                    if tarinfo.isreg():
-                        e = tar.extractfile(tarinfo)
-                        with open(os.path.join(ROLES_DIR,os.path.basename(tarinfo.name)), 'w') as dst:
-                            dst.write(e.read())
-
-
-        cmd = ["chef-solo", "-o", runlist, "-j", attribute_file.name, "--force-formatter", "-r", chef_cookbooks]
-    else:
-        # Chef client mode
-        cmd = ["chef-client", "-o", runlist, "-j", attribute_file.name, "--force-formatter"]
-    try:
-        #TODO: I chose to use --force-formatter here to push output through stdout to be caught inside sudo()
-        #      so that it can be included in exceptions, but with current implementation of sudo(),
-        #      I'm completely losing output of successful runs. If needed, we can perhaps put it back in /var/log/chef/
-        sudo(*cmd)
-        os.remove(attribute_file.name)  # on failure, leave for debugging
-    except SudoError as exc:
-        raise ChefError("The chef run failed\n"
-                        "runlist: {runlist}\nattributes: {attributes}\nexception: \n{exc}".format(**locals()))
-
-
-def set_up_chef_client(func):
-    """Decorates a method with a call to install and set up chef-client, if needed"""
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        """Pass to install_chef the fields it needs"""
-        required_fields = {'chef_version', 'chef_environment'}
-        chef_client_fields = {'chef_server_url', 'chef_validator_name', 'chef_validation'}
-        chef_solo_fieds = {'chef_cookbooks'}
-        installer_fields = required_fields.union(chef_client_fields).union(chef_solo_fieds)
-
-        # relationship based task
-        if '__source_properties' in kwargs:
-            kwargs = kwargs['__source_properties']
-
-        missing_fields = required_fields.difference(kwargs.keys())
-        if missing_fields:
-            raise ChefError("The following required field(s) are missing: %s"
-                               % ", ".join(missing_fields))
-
-        install_args = {k: v for k, v in kwargs.items() if k in installer_fields}
-        if 'chef_cookbooks' in install_args:
-            install_args['solo'] = True
-            del install_args['chef_cookbooks']
-        install_chef(**install_args)
-
-        return func(*args, **kwargs)
-
-    return wrapper
+    args = [runlist]
+    kwargs = dict(chef_attributes=chef_attributes, **kwargs)
+    # print "P0", args, kwargs
+    chef_manager = get_manager(*args, **kwargs)
+    chef_manager.install(*args, **kwargs)
+    chef_manager.run(*args, **kwargs)
 
 if __name__ == '__main__':
     import argparse
@@ -262,22 +294,54 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Installs and runs Chef (client or solo)"
     )
-    parser.add_argument(
-        '--cookbooks',
-        type=str
-    )
+    # common
     parser.add_argument(
         '-r', '--run-list',
         type=str
     )
+    # solo
     parser.add_argument(
         '--roles',
         type=str
     )
+    parser.add_argument(
+        '--cookbooks',
+        type=str
+    )
+    # client
+    parser.add_argument(
+        '-e', '--environment',
+        type=str,
+        default='_default',
+    )
+    parser.add_argument(
+        '-u', '--url',
+        help='Server URL',
+        type=str,
+    )
+    parser.add_argument(
+        '--val-c',
+        help='Validation certificate',
+        type=str,
+    )
+
+    parser.add_argument(
+        '--val-n',
+        help='Validator name',
+        type=str,
+    )
+
     args = parser.parse_args()
     # print(args)
-    @set_up_chef_client
-    def task(**kwargs):
-        run_chef(args.run_list, {}, chef_cookbooks=args.cookbooks, chef_roles=args.roles)
     logger = l.getLogger(__name__)
-    task(chef_environment='_default', chef_version='11.4.4-2')
+    logger.setLevel(l.DEBUG)
+    run_chef(
+        args.run_list, {},
+        chef_environment=args.environment,
+        chef_version='11.4.4-2',
+        chef_cookbooks=args.cookbooks,
+        chef_roles=args.roles,
+        chef_server_url=args.url,
+        chef_validator_name=args.val_n,
+        chef_validation=args.val_c.replace('^', '\n'),
+    )
