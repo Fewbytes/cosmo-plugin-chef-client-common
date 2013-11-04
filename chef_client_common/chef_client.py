@@ -56,13 +56,12 @@ class ChefManager(object):
         if cls.REQUIRED_ARGS.difference(kwargs.keys()):
             return False
         for arg in cls.REQUIRED_ARGS:
-            if not kwargs[arg]:
+            if kwargs[arg] is None:
                 return False
         return True
 
     @classmethod
     def assert_args(cls, *args, **kwargs):
-        # print cls.REQUIRED_ARGS
         missing_fields = (cls.REQUIRED_ARGS).union({'chef_version'}).difference(kwargs.keys())
         if missing_fields:
             raise ChefError("The following required field(s) are missing: {0}".format(", ".join(missing_fields)))
@@ -76,18 +75,15 @@ class ChefManager(object):
         return self._extract_chef_version(subprocess.check_output(["/usr/bin/sudo", binary, "--version"]))
 
     def install(self, *args, **kwargs):
-        # print("install() 1")
         """If needed, install chef-client and point it to the server"""
         chef_version = kwargs['chef_version']
         current_version = self.get_version()
-        # print current_version, self._extract_chef_version(chef_version), current_version == self._extract_chef_version(chef_version)
         if current_version:
             if current_version == self._extract_chef_version(chef_version):
                 return
             else:
                 self.uninstall()
 
-        # print("install() 2")
         logger.info('Installing Chef [chef_version=%s]', chef_version)
         chef_install_script = tempfile.NamedTemporaryFile(suffix="install.sh", delete=False)
         chef_install_script.close()
@@ -99,14 +95,11 @@ class ChefManager(object):
         except Exception as exc:
             raise ChefError("Chef install failed on:\n%s" % exc)
 
-        # print("install() 3")
         logger.info('Setting up Chef [chef_server=\n%s]', kwargs.get('chef_server_url'))
 
         for directory in '/etc/chef', '/var/chef', '/var/log/chef', ROLES_DIR:
             self._sudo("mkdir", "-p", directory)
 
-        # print("install() 4")
-        # print "P1", args, kwargs
         self._install_files(*args, **kwargs)
 
     def uninstall(self):
@@ -125,7 +118,9 @@ class ChefManager(object):
         else:
             logger.info("Chef uninstall is unimplemented for this platform, proceeding anyway")
 
-    def run(self, runlist, chef_attributes={}, *args, **kwargs):
+    def run(self, runlist, chef_attributes=None, *args, **kwargs):
+        if chef_attributes is None:
+            chef_attributes = {}
         self._prepare_for_run(runlist, *args, **kwargs)
         self.attribute_file = tempfile.NamedTemporaryFile(suffix="chef_attributes.json",
                                                      delete=False)
@@ -190,7 +185,6 @@ class ChefManager(object):
         with tempfile.NamedTemporaryFile(delete=False) as temp_file:
             temp_file.write(contents)
 
-        # print temp_file.name, filename
         self._sudo("mv", temp_file.name, filename)
 
 
@@ -205,7 +199,6 @@ class ChefClientManager(ChefManager):
         return 'chef-client'
 
     def _install_files(self, *args, **kwargs):
-        # print "P2", args, kwargs
         if kwargs.get('chef_validation'):
             self._sudo_write_file('/etc/chef/validation.pem', kwargs['chef_validation'])
         self._sudo_write_file('/etc/chef/client.rb', """
@@ -262,7 +255,7 @@ def get_manager(*args, **kwargs):
     raise ChefError("Failed to find appropriate Chef manager for the specified arguments ({0}, {1}). Possible arguments sets are: {2}".format(args, kwargs, arguments_sets))
 
 
-def run_chef(runlist, chef_attributes={}, **kwargs):
+def run_chef(runlist, chef_attributes=None, **kwargs):
     """Run runlist with chef-client using these chef_attributes(json or dict)"""
     # I considered moving the attribute handling to the set-up phase but
     # eventually left it here, to allow specific tasks to easily override them.
@@ -280,12 +273,10 @@ def run_chef(runlist, chef_attributes={}, **kwargs):
         except ValueError:
             raise ChefError("Failed json validation of chef chef_attributes:\n%s" % chef_attributes)
 
-    args = [runlist]
     kwargs = dict(chef_attributes=chef_attributes, **kwargs)
-    # print "P0", args, kwargs
-    chef_manager = get_manager(*args, **kwargs)
-    chef_manager.install(*args, **kwargs)
-    chef_manager.run(*args, **kwargs)
+    chef_manager = get_manager(runlist, **kwargs)
+    chef_manager.install(runlist, **kwargs)
+    chef_manager.run(runlist, **kwargs)
 
 if __name__ == '__main__':
     import argparse
@@ -301,10 +292,12 @@ if __name__ == '__main__':
     # solo
     parser.add_argument(
         '--roles',
+        help='Roles .tar.gz URL',
         type=str
     )
     parser.add_argument(
         '--cookbooks',
+        help='Cookbooks .tar.gz URL',
         type=str
     )
     # client
@@ -330,12 +323,18 @@ if __name__ == '__main__':
         type=str,
     )
 
+    parser.add_argument(
+        '--as-source-properties',
+        default=False,
+        dest='as_source_properties',
+        action='store_true',
+    )
+
+    parser.set_defaults(as_source_properties=False)
     args = parser.parse_args()
-    # print(args)
     logger = l.getLogger(__name__)
     logger.setLevel(l.DEBUG)
-    run_chef(
-        args.run_list, {},
+    kwargs = dict(
         chef_environment=args.environment,
         chef_version='11.4.4-2',
         chef_cookbooks=args.cookbooks,
@@ -344,3 +343,6 @@ if __name__ == '__main__':
         chef_validator_name=args.val_n,
         chef_validation=args.val_c.replace('^', '\n'),
     )
+    if args.as_source_properties:
+        kwargs = {'__source_properties': kwargs}
+    run_chef(args.run_list, {'test': 1}, **kwargs)
