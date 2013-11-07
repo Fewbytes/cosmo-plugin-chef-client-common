@@ -248,7 +248,7 @@ def get_manager(*args, **kwargs):
     managers = ChefClientManager, ChefSoloManager
     for cls in managers:
         if cls.can_handle(*args, **kwargs):
-            logger.info("Chef manager class: %s".format(cls))
+            logger.info("Chef manager class: {}".format(cls))
             cls.assert_args(*args, **kwargs)
             return cls()
     arguments_sets = '; '.join(['(for ' + m.NAME + '): ' + ', '.join(list(m.REQUIRED_ARGS)) for m in managers])
@@ -289,6 +289,10 @@ if __name__ == '__main__':
         '-r', '--run-list',
         type=str
     )
+    parser.add_argument(
+        '-a', '--attributes',
+        type=str
+    )
     # solo
     parser.add_argument(
         '--roles',
@@ -313,7 +317,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--val-c',
-        help='Validation certificate',
+        help='Validation certificate. You can use caret (^) characters instead of newlines for convenience to pass the certificate in one line.',
         type=str,
     )
 
@@ -332,8 +336,24 @@ if __name__ == '__main__':
 
     parser.set_defaults(as_source_properties=False)
     args = parser.parse_args()
-    logger = l.getLogger(__name__)
+
+    if args.val_c:
+        chef_validation = args.val_c.replace('^', '\n')
+    else:
+        chef_validation = None
+
+    if args.attributes:
+        chef_attributes = json.loads(args.attributes)
+    else:
+        chef_attributes = {}
+
+    # Setup global logger:
+    logger = l.getLogger('cosmo_plugin_chef_client_common')
     logger.setLevel(l.DEBUG)
+    ch = l.StreamHandler()
+    ch.setLevel(l.DEBUG)
+    logger.addHandler(ch)
+
     kwargs = dict(
         chef_environment=args.environment,
         chef_version='11.4.4-2',
@@ -341,8 +361,8 @@ if __name__ == '__main__':
         chef_roles=args.roles,
         chef_server_url=args.url,
         chef_validator_name=args.val_n,
-        chef_validation=args.val_c.replace('^', '\n'),
+        chef_validation=chef_validation
     )
     if args.as_source_properties:
         kwargs = {'__source_properties': kwargs}
-    run_chef(args.run_list, {'test': 1}, **kwargs)
+    run_chef(args.run_list, chef_attributes, **kwargs)
