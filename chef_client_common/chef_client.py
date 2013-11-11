@@ -267,7 +267,6 @@ class ChefSoloManager(ChefManager):
 
         if kwargs['chef_environment'] != '_default':
             v = self.get_version()
-            print [int(x) for x in v.split('.')]
             if [int(x) for x in v.split('.')] < ENVS_MIN_VER:
                 raise ChefError("Chef solo environments are supported starting at {0} but you are using {1}".
                                 format(ENVS_MIN_VER_STR, v))
