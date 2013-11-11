@@ -237,7 +237,6 @@ class ChefSoloManager(ChefManager):
     def _url_to_dir(self, url, dst_dir):
         """Downloads .tar.gz from `url` and extracts to `dst_dir`"""
 
-        print("_url_to_dir({},{})".format(url, dst_dir))
         if url is None:
             return
 
