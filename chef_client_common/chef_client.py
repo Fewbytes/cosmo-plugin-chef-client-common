@@ -31,9 +31,15 @@ import urllib
 import tempfile
 import subprocess
 import json
+import errno
 
 CHEF_INSTALLER_URL = "https://www.opscode.com/chef/install.sh"
 ROLES_DIR = "/var/chef/roles"
+ENVS_DIR = "/var/chef/environments"
+DATABAGS_DIR = "/var/chef/data_bags"
+
+ENVS_MIN_VER = [11, 8]
+ENVS_MIN_VER_STR = '.'.join([str(x) for x in ENVS_MIN_VER])
 
 logger = get_task_logger(__name__)
 
@@ -97,7 +103,7 @@ class ChefManager(object):
 
         logger.info('Setting up Chef [chef_server=\n%s]', kwargs.get('chef_server_url'))
 
-        for directory in '/etc/chef', '/var/chef', '/var/log/chef', ROLES_DIR:
+        for directory in '/etc/chef', '/var/chef', '/var/log/chef', DATABAGS_DIR, ENVS_DIR, ROLES_DIR:
             self._sudo("mkdir", "-p", directory)
 
         self._install_files(*args, **kwargs)
@@ -123,7 +129,7 @@ class ChefManager(object):
             chef_attributes = {}
         self._prepare_for_run(runlist, *args, **kwargs)
         self.attribute_file = tempfile.NamedTemporaryFile(suffix="chef_attributes.json",
-                                                     delete=False)
+                                                          delete=False)
         json.dump(chef_attributes, self.attribute_file)
         self.attribute_file.close()
 
@@ -131,11 +137,10 @@ class ChefManager(object):
 
         try:
             self._sudo(*cmd)
-            os.remove(self.attribute_file.name) # on failure, leave for debugging
+            os.remove(self.attribute_file.name)  # on failure, leave for debugging
         except SudoError as exc:
             raise ChefError("The chef run failed\n"
                             "runlist: {0}\nattributes: {1}\nexception: \n{2}".format(runlist, kwargs.get('chef_attributes'), exc))
-
 
     def _prepare_for_run(self, *args, **kwargs):
         pass
@@ -160,7 +165,7 @@ class ChefManager(object):
         def get_file_contents(file_obj):
             file_obj.flush()
             file_obj.seek(0)
-            return  ''.join(file_obj.readlines())
+            return ''.join(file_obj.readlines())
 
         command_list = ["/usr/bin/sudo"] + list(args)
         logger.info("Running: '%s'", ' '.join(command_list))
@@ -171,6 +176,8 @@ class ChefManager(object):
         stderr = tempfile.TemporaryFile('rw+b')
         try:
             subprocess.check_call(command_list, stdout=stdout, stderr=stderr)
+            logger.info("Chef stdout follows: \n%s", get_file_contents(stdout))
+            logger.info("Chef stderr follows: \n%s", get_file_contents(stderr))
         except subprocess.CalledProcessError as exc:
             raise SudoError("{exc}\nSTDOUT:\n{stdout}\nSTDERR:{stderr}".format(
                 exc=exc, stdout=get_file_contents(stdout), stderr=get_file_contents(stderr))
@@ -178,7 +185,6 @@ class ChefManager(object):
         finally:
             stdout.close()
             stderr.close()
-
 
     def _sudo_write_file(self, filename, contents):
         """a helper to create a file with sudo"""
@@ -190,11 +196,14 @@ class ChefManager(object):
 
 class ChefClientManager(ChefManager):
 
+    """ Installs Chef client """
+
     NAME = 'client'
     REQUIRED_ARGS = {'chef_server_url', 'chef_validator_name', 'chef_validation', 'chef_environment'}
 
     def _get_cmd(self, runlist, *args, **kwargs):
         return ["chef-client", "-o", runlist, "-j", self.attribute_file.name, "--force-formatter"]
+
     def _get_binary(self):
         return 'chef-client'
 
@@ -220,28 +229,67 @@ Chef::Log::Formatter.show_time = true
 
 class ChefSoloManager(ChefManager):
 
+    """ Installs Chef solo """
+
     NAME = 'solo'
     REQUIRED_ARGS = {'chef_cookbooks'}
 
+    def _url_to_dir(self, url, dst_dir):
+        """Downloads .tar.gz from `url` and extracts to `dst_dir`"""
+
+        print("_url_to_dir({},{})".format(url, dst_dir))
+        if url is None:
+            return
+
+        temp_archive = tempfile.NamedTemporaryFile(suffix='.url_to_dir.tar.gz', delete=False)
+        temp_archive.write(requests.get(url).content)
+        temp_archive.flush()
+        temp_archive.close()
+        command_list = ['tar', '-C', dst_dir, '--xform', 's#^' + os.path.basename(dst_dir) + '/##', '-vxzf', temp_archive.name]
+        try:
+            logger.info("Running: '%s'", ' '.join(command_list))
+            subprocess.check_call(command_list)
+        except subprocess.CalledProcessError as exc:
+            raise ChefError("Failed to extract file {0} to directory {1} which was downloaded from {2}. Command: {3} Exception: {4}".format(temp_archive.name, dst_dir, url, command_list, exc))
+        os.remove(temp_archive.name)  # on failure, leave for debugging
+        try:
+            os.rmdir(os.path.join(dst_dir, os.path.basename(dst_dir)))
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                raise e
+
     def _prepare_for_run(self, *args, **kwargs):
-        if kwargs.get('chef_roles'):
-            import tarfile
-            import StringIO
-            with tarfile.open(fileobj=StringIO.StringIO(requests.get(kwargs['chef_roles']).content), mode="r:gz") as tar:
-                for tarinfo in tar:
-                    if tarinfo.isreg():
-                        e = tar.extractfile(tarinfo)
-                        with open(os.path.join(ROLES_DIR, os.path.basename(tarinfo.name)), 'w') as dst:
-                            dst.write(e.read())
+        for dl in ('chef_environments', ENVS_DIR), ('chef_databags', DATABAGS_DIR), ('chef_roles', ROLES_DIR):
+            self._url_to_dir(kwargs.get(dl[0]), dl[1])
 
     def _get_cmd(self, runlist, *args, **kwargs):
-        return ["chef-solo", "-o", runlist, "-j", self.attribute_file.name, "--force-formatter", "-r", kwargs['chef_cookbooks']]
+        cmd = ["chef-solo"]
+
+        if kwargs['chef_environment'] != '_default':
+            v = self.get_version()
+            print [int(x) for x in v.split('.')]
+            if [int(x) for x in v.split('.')] < ENVS_MIN_VER:
+                raise ChefError("Chef solo environments are supported starting at {0} but you are using {1}".
+                                format(ENVS_MIN_VER_STR, v))
+            cmd += ["-E", kwargs['chef_environment']]
+        cmd += [
+            "-o", runlist,
+            "-j", self.attribute_file.name,
+            "--force-formatter",
+            "-r", kwargs['chef_cookbooks']
+        ]
+        return cmd
 
     def _get_binary(self):
         return 'chef-solo'
 
     def _install_files(self, *args, **kwargs):
-        self._sudo_write_file('/etc/chef/solo.rb', '')
+        # Do not put 'environment' in this file.
+        # It causes chef solo to act as client (than fails when certificate is missing)
+        self._sudo_write_file('/etc/chef/solo.rb', """
+log_location       "/var/log/chef/solo.log"
+            """.format(**kwargs)
+        )
 
 
 def get_manager(*args, **kwargs):
@@ -295,13 +343,23 @@ if __name__ == '__main__':
     )
     # solo
     parser.add_argument(
-        '--roles',
-        help='Roles .tar.gz URL',
+        '--cookbooks',
+        help='Cookbooks .tar.gz URL',
         type=str
     )
     parser.add_argument(
-        '--cookbooks',
-        help='Cookbooks .tar.gz URL',
+        '--databags',
+        help='Data bags .tar.gz URL',
+        type=str
+    )
+    parser.add_argument(
+        '--environments',
+        help='Environments .tar.gz URL',
+        type=str
+    )
+    parser.add_argument(
+        '--roles',
+        help='Roles .tar.gz URL',
         type=str
     )
     # client
@@ -356,9 +414,13 @@ if __name__ == '__main__':
 
     kwargs = dict(
         chef_environment=args.environment,
-        chef_version='11.4.4-2',
+        chef_version='11.8.0',
+
         chef_cookbooks=args.cookbooks,
+        chef_databags=args.databags,
+        chef_environments=args.environments,
         chef_roles=args.roles,
+
         chef_server_url=args.url,
         chef_validator_name=args.val_n,
         chef_validation=chef_validation
