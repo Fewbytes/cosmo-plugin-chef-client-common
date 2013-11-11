@@ -240,11 +240,12 @@ class ChefSoloManager(ChefManager):
         if url is None:
             return
 
+        logger.info("Downloading from {0} and unpacking to {1}".format(url, dst_dir))
         temp_archive = tempfile.NamedTemporaryFile(suffix='.url_to_dir.tar.gz', delete=False)
         temp_archive.write(requests.get(url).content)
         temp_archive.flush()
         temp_archive.close()
-        command_list = ['tar', '-C', dst_dir, '--xform', 's#^' + os.path.basename(dst_dir) + '/##', '-vxzf', temp_archive.name]
+        command_list = ['tar', '-C', dst_dir, '--xform', 's#^' + os.path.basename(dst_dir) + '/##', '-xzf', temp_archive.name]
         try:
             logger.info("Running: '%s'", ' '.join(command_list))
             subprocess.check_call(command_list)
